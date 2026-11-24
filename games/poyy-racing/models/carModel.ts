@@ -20,7 +20,12 @@ export type RacerCarRig = {
   bodyTiltGroup: THREE.Group;
   frontWheels: THREE.Group[];
   allWheels: THREE.Group[];
+  wheelRadius: number;
+  headlightMaterial: THREE.MeshStandardMaterial;
+  headlightBeams: THREE.Group;
+  headlightSpots: THREE.SpotLight[];
   brakeMaterial: THREE.MeshStandardMaterial;
+  reverseMaterial: THREE.MeshStandardMaterial;
   nitroFlames: THREE.Mesh[];
   driftSmoke: THREE.Group;
   dispose: () => void;
@@ -40,7 +45,22 @@ function createSoftShadowTexture() {
   return new THREE.CanvasTexture(canvas);
 }
 
+function createBeamFadeTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 128;
+  const ctx = canvas.getContext("2d")!;
+  const grad = ctx.createLinearGradient(0, 0, 0, 128);
+  grad.addColorStop(0, "rgba(225, 242, 255, 0.75)");
+  grad.addColorStop(0.35, "rgba(215, 238, 255, 0.32)");
+  grad.addColorStop(1, "rgba(210, 235, 255, 0.0)");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 64, 128);
+  return new THREE.CanvasTexture(canvas);
+}
+
 let cachedShadowTex: THREE.CanvasTexture | undefined;
+let cachedBeamTex: THREE.CanvasTexture | undefined;
 let cachedMobilGltfPromise: Promise<GLTF> | null = null;
 
 function loadMobilGltf(): Promise<GLTF> {
@@ -63,6 +83,106 @@ function createContactShadow() {
   contactShadow.rotation.x = -Math.PI / 2;
   contactShadow.position.y = 0.04;
   return contactShadow;
+}
+
+function createLightingAssembly(
+  bodyTiltGroup: THREE.Group,
+  options: {
+    frontZ: number;
+    headlightY: number;
+    headlightX: number;
+    rearZ: number;
+    reverseY: number;
+    reverseX: number;
+    enableSpotLights: boolean;
+  },
+) {
+  if (!cachedBeamTex) cachedBeamTex = createBeamFadeTexture();
+
+  const headlightMaterial = new THREE.MeshStandardMaterial({
+    color: 0xdbeafe,
+    emissive: 0xe8f4ff,
+    emissiveIntensity: 4.5,
+    roughness: 0.15,
+    metalness: 0.1,
+  });
+
+  const reverseMaterial = new THREE.MeshStandardMaterial({
+    color: 0xe2e8f0,
+    emissive: 0xffffff,
+    emissiveIntensity: 0,
+    roughness: 0.18,
+    metalness: 0.1,
+  });
+
+  // Front LED headlight lenses precisely proportioned to the front bumper
+  const lensGeo = new THREE.BoxGeometry(0.24, 0.055, 0.04);
+  const leftLens = new THREE.Mesh(lensGeo, headlightMaterial);
+  leftLens.position.set(-options.headlightX, options.headlightY, options.frontZ);
+  leftLens.rotation.y = 0.15;
+
+  const rightLens = new THREE.Mesh(lensGeo, headlightMaterial);
+  rightLens.position.set(options.headlightX, options.headlightY, options.frontZ);
+  rightLens.rotation.y = -0.15;
+  bodyTiltGroup.add(leftLens, rightLens);
+
+  // Volumetric headlight cone beams projecting forward along -Z
+  const headlightBeams = new THREE.Group();
+  const coneLen = 14.0;
+  const coneGeo = new THREE.ConeGeometry(1.25, coneLen, 22, 1, true);
+  coneGeo.translate(0, -coneLen * 0.5, 0);
+  coneGeo.rotateX(-Math.PI / 2); // projects forward along -Z
+
+  const beamMat = new THREE.MeshBasicMaterial({
+    map: cachedBeamTex,
+    color: 0xe0f2fe,
+    transparent: true,
+    opacity: 0.22,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+  });
+
+  const beamL = new THREE.Mesh(coneGeo, beamMat);
+  beamL.position.set(-options.headlightX, options.headlightY, options.frontZ - 0.02);
+  beamL.rotation.x = -0.03;
+
+  const beamR = new THREE.Mesh(coneGeo, beamMat);
+  beamR.position.set(options.headlightX, options.headlightY, options.frontZ - 0.02);
+  beamR.rotation.x = -0.03;
+
+  headlightBeams.add(beamL, beamR);
+  bodyTiltGroup.add(headlightBeams);
+
+  // Real dynamic SpotLights for player illumination
+  const headlightSpots: THREE.SpotLight[] = [];
+  if (options.enableSpotLights) {
+    const createSpot = (xOffset: number) => {
+      const spot = new THREE.SpotLight(0xf0f7ff, 48, 90, 0.4, 0.58, 1.25);
+      spot.castShadow = false;
+      spot.position.set(xOffset, options.headlightY + 0.04, options.frontZ - 0.02);
+      spot.target.position.set(xOffset * 1.05, 0.04, options.frontZ - 32);
+      bodyTiltGroup.add(spot, spot.target);
+      headlightSpots.push(spot);
+    };
+    createSpot(-options.headlightX);
+    createSpot(options.headlightX);
+  }
+
+  // Twin rear white reverse light emitters precisely proportioned to rear bumper
+  const revGeo = new THREE.BoxGeometry(0.2, 0.045, 0.035);
+  const revL = new THREE.Mesh(revGeo, reverseMaterial);
+  revL.position.set(-options.reverseX, options.reverseY, options.rearZ);
+  const revR = new THREE.Mesh(revGeo, reverseMaterial);
+  revR.position.set(options.reverseX, options.reverseY, options.rearZ);
+  bodyTiltGroup.add(revL, revR);
+
+  return {
+    headlightMaterial,
+    headlightBeams,
+    headlightSpots,
+    reverseMaterial,
+  };
 }
 
 function createEffects(bodyTiltGroup: THREE.Group, wheelBaseRearZ: number) {
@@ -122,8 +242,7 @@ function cloneMaterialsOnObject(root: THREE.Object3D) {
   return Array.from(clonedMap.values());
 }
 
-function buildMobilGlbContents(gltf: GLTF, livery: CarLivery) {
-  // Assemble completely inside a detached identity-origin group so world-space Box3 is clean
+function buildMobilGlbContents(gltf: GLTF, livery: CarLivery, isPlayer: boolean) {
   const tempRoot = new THREE.Group();
   const bodyTiltGroup = new THREE.Group();
   const modelPivot = new THREE.Group();
@@ -166,7 +285,6 @@ function buildMobilGlbContents(gltf: GLTF, livery: CarLivery) {
     });
   }
 
-  // mobil.glb front faces +Z in world space; rotate PI around Y so front faces -Z (Three.js forward)
   modelPivot.rotation.y = Math.PI;
   modelPivot.add(clonedScene);
   tempRoot.add(bodyTiltGroup);
@@ -178,7 +296,6 @@ function buildMobilGlbContents(gltf: GLTF, livery: CarLivery) {
     .map((name) => ({ name, obj: clonedScene.getObjectByName(name) }))
     .filter((entry): entry is { name: (typeof wheelNames)[number]; obj: THREE.Object3D } => Boolean(entry.obj));
 
-  // Measure using Car Texture meshes + wheels to avoid stray interior outlier vertices in Carbon.002
   const refBox = new THREE.Box3();
   const expandWithCoreMeshes = () => {
     refBox.makeEmpty();
@@ -215,13 +332,29 @@ function buildMobilGlbContents(gltf: GLTF, livery: CarLivery) {
   modelPivot.position.set(-refCenter.x, -groundY, -refCenter.z);
   tempRoot.updateMatrixWorld(true);
 
+  const finalCarBox = new THREE.Box3().setFromObject(modelPivot);
+  const carMinZ = finalCarBox.min.z;
+  const carMaxZ = finalCarBox.max.z;
+  const carMinX = finalCarBox.min.x;
+  const carMaxX = finalCarBox.max.x;
+  const carMinY = finalCarBox.min.y;
+  const carMaxY = finalCarBox.max.y;
+
   const frontWheels: THREE.Group[] = [];
   const allWheels: THREE.Group[] = [];
   let rearWheelZ = 1.35;
+  let measuredRadiusSum = 0;
+  let measuredWheelCount = 0;
 
   for (const { name, obj } of wheelNodes) {
     const wBox = new THREE.Box3().setFromObject(obj);
     const wCenter = wBox.getCenter(new THREE.Vector3());
+    const wSize = wBox.getSize(new THREE.Vector3());
+    if (wSize.y > 0.1) {
+      measuredRadiusSum += wSize.y * 0.5;
+      measuredWheelCount += 1;
+    }
+
     const steerPivot = new THREE.Group();
     steerPivot.position.copy(wCenter);
     const spinGroup = new THREE.Group();
@@ -238,6 +371,19 @@ function buildMobilGlbContents(gltf: GLTF, livery: CarLivery) {
     allWheels.push(spinGroup);
   }
 
+  const wheelRadius = measuredWheelCount > 0 ? measuredRadiusSum / measuredWheelCount : 0.35;
+
+  // Precisely align headlights at true front (carMinZ) and tail lights at true rear (carMaxZ)
+  const lights = createLightingAssembly(bodyTiltGroup, {
+    frontZ: carMinZ - 0.04,
+    headlightY: carMinY + (carMaxY - carMinY) * 0.42,
+    headlightX: Math.abs(carMaxX) * 0.62,
+    rearZ: carMaxZ + 0.04,
+    reverseY: carMinY + (carMaxY - carMinY) * 0.40,
+    reverseX: Math.abs(carMaxX) * 0.52,
+    enableSpotLights: isPlayer,
+  });
+
   const contactShadow = createContactShadow();
   const { nitroFlames, driftSmoke } = createEffects(bodyTiltGroup, rearWheelZ);
   tempRoot.add(contactShadow, driftSmoke);
@@ -247,13 +393,15 @@ function buildMobilGlbContents(gltf: GLTF, livery: CarLivery) {
     bodyTiltGroup,
     frontWheels,
     allWheels,
+    wheelRadius,
+    ...lights,
     brakeMaterial,
     nitroFlames,
     driftSmoke,
   };
 }
 
-function buildFallbackRigContents(livery: CarLivery) {
+function buildFallbackRigContents(livery: CarLivery, isPlayer: boolean) {
   const tempRoot = new THREE.Group();
   const bodyTiltGroup = new THREE.Group();
   tempRoot.add(bodyTiltGroup);
@@ -285,13 +433,14 @@ function buildFallbackRigContents(livery: CarLivery) {
   tail.position.set(0, 0.56, 2.18);
   bodyTiltGroup.add(hull, cabin, tail);
 
-  const tireGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.28, 18);
+  const wheelRadius = 0.36;
+  const tireGeo = new THREE.CylinderGeometry(wheelRadius, wheelRadius, 0.28, 18);
   tireGeo.rotateZ(Math.PI / 2);
   const wheelCoords: Array<[number, number, number]> = [
-    [-0.96, 0.36, -1.28],
-    [0.96, 0.36, -1.28],
-    [-0.96, 0.36, 1.28],
-    [0.96, 0.36, 1.28],
+    [-0.96, wheelRadius, -1.28],
+    [0.96, wheelRadius, -1.28],
+    [-0.96, wheelRadius, 1.28],
+    [0.96, wheelRadius, 1.28],
   ];
   const frontWheels: THREE.Group[] = [];
   const allWheels: THREE.Group[] = [];
@@ -308,6 +457,16 @@ function buildFallbackRigContents(livery: CarLivery) {
     allWheels.push(spinGroup);
   });
 
+  const lights = createLightingAssembly(bodyTiltGroup, {
+    frontZ: -2.18,
+    headlightY: 0.52,
+    headlightX: 0.68,
+    rearZ: 2.18,
+    reverseY: 0.48,
+    reverseX: 0.46,
+    enableSpotLights: isPlayer,
+  });
+
   const { nitroFlames, driftSmoke } = createEffects(bodyTiltGroup, 1.35);
   tempRoot.add(createContactShadow(), driftSmoke);
 
@@ -316,6 +475,8 @@ function buildFallbackRigContents(livery: CarLivery) {
     bodyTiltGroup,
     frontWheels,
     allWheels,
+    wheelRadius,
+    ...lights,
     brakeMaterial,
     nitroFlames,
     driftSmoke,
@@ -323,8 +484,9 @@ function buildFallbackRigContents(livery: CarLivery) {
 }
 
 export function createRacerCarMesh(livery: CarLivery): RacerCarRig {
+  const isPlayer = livery.id === "player";
   const root = new THREE.Group();
-  const fallback = buildFallbackRigContents(livery);
+  const fallback = buildFallbackRigContents(livery, isPlayer);
   fallback.children.forEach((child) => root.add(child));
 
   let isDisposed = false;
@@ -334,7 +496,12 @@ export function createRacerCarMesh(livery: CarLivery): RacerCarRig {
     bodyTiltGroup: fallback.bodyTiltGroup,
     frontWheels: fallback.frontWheels,
     allWheels: fallback.allWheels,
+    wheelRadius: fallback.wheelRadius,
+    headlightMaterial: fallback.headlightMaterial,
+    headlightBeams: fallback.headlightBeams,
+    headlightSpots: fallback.headlightSpots,
     brakeMaterial: fallback.brakeMaterial,
+    reverseMaterial: fallback.reverseMaterial,
     nitroFlames: fallback.nitroFlames,
     driftSmoke: fallback.driftSmoke,
     dispose: () => {
@@ -342,17 +509,21 @@ export function createRacerCarMesh(livery: CarLivery): RacerCarRig {
     },
   };
 
-  // Hot-swap in user's Blender mobil.glb model as soon as loaded
   loadMobilGltf()
     .then((gltf) => {
       if (isDisposed) return;
-      const glbRig = buildMobilGlbContents(gltf, livery);
+      const glbRig = buildMobilGlbContents(gltf, livery, isPlayer);
       root.clear();
       glbRig.children.forEach((child) => root.add(child));
       rig.bodyTiltGroup = glbRig.bodyTiltGroup;
       rig.frontWheels = glbRig.frontWheels;
       rig.allWheels = glbRig.allWheels;
+      rig.wheelRadius = glbRig.wheelRadius;
+      rig.headlightMaterial = glbRig.headlightMaterial;
+      rig.headlightBeams = glbRig.headlightBeams;
+      rig.headlightSpots = glbRig.headlightSpots;
       rig.brakeMaterial = glbRig.brakeMaterial;
+      rig.reverseMaterial = glbRig.reverseMaterial;
       rig.nitroFlames = glbRig.nitroFlames;
       rig.driftSmoke = glbRig.driftSmoke;
     })

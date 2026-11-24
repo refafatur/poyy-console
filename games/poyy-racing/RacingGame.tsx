@@ -4,9 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import type { Socket } from "socket.io-client";
-import { ArrowLeft, Music, Pause, Play, RotateCcw, Trophy, Volume2, VolumeX } from "lucide-react";
+import { ArrowLeft, FastForward, Lightbulb, Music, Pause, Play, RotateCcw, Trophy, Volume2, VolumeX } from "lucide-react";
 import { useUniversalInputs } from "@/hooks/use-universal-inputs";
-import { RacingAudioEngine } from "@/games/poyy-racing/audio";
+import { RacingAudioEngine, type RivalAudioInput } from "@/games/poyy-racing/audio";
 import { CAR_LIVERIES, createRacerCarMesh, type RacerCarRig } from "@/games/poyy-racing/models/carModel";
 import { createCitySkyline } from "@/games/poyy-racing/models/cityBuildings";
 import {
@@ -17,6 +17,7 @@ import {
 } from "@/games/poyy-racing/track";
 
 export type GameMode = "RACE" | "TIME TRIAL" | "FREE DRIVE";
+export type RacePhase = "INTRO" | "COUNTDOWN" | "RACING";
 
 type RacerDot = { id: string; x: number; y: number; color: string; isPlayer: boolean };
 
@@ -28,7 +29,9 @@ type Telemetry = {
   totalRacers: number;
   time: number;
   bestLap: number | null;
+  phase: RacePhase;
   countdown: number;
+  showGo: boolean;
   drifting: boolean;
   wrongWay: boolean;
   finished: boolean;
@@ -44,10 +47,18 @@ type RivalState = {
   targetLateral: number;
   speed: number;
   baseSpeed: number;
+  steerAngle: number;
+  braking: boolean;
+  worldX: number;
+  worldY: number;
+  worldZ: number;
+  tanX: number;
+  tanZ: number;
   rig: RacerCarRig;
 };
 
 const TOTAL_LAPS = 3;
+const INTRO_DURATION = 6.0;
 
 const initialTelemetry: Telemetry = {
   speed: 0,
@@ -57,7 +68,9 @@ const initialTelemetry: Telemetry = {
   totalRacers: 4,
   time: 0,
   bestLap: null,
+  phase: "INTRO",
   countdown: 3,
+  showGo: false,
   drifting: false,
   wrongWay: false,
   finished: false,
@@ -77,6 +90,22 @@ const _negFwd = new THREE.Vector3();
 const _rivalPos = new THREE.Vector3();
 const _camTarget = new THREE.Vector3();
 const _camLook = new THREE.Vector3();
+const _introPos = new THREE.Vector3();
+const _introTan = new THREE.Vector3();
+const _introRight = new THREE.Vector3();
+const _introUp = new THREE.Vector3();
+const _heroPos = new THREE.Vector3();
+const _heroLook = new THREE.Vector3();
+const _chasePos = new THREE.Vector3();
+const _chaseLook = new THREE.Vector3();
+const _listenerPos = new THREE.Vector3();
+const _listenerFwd = new THREE.Vector3();
+const _listenerRight = new THREE.Vector3();
+const _relVec = new THREE.Vector3();
+const _otherPos = new THREE.Vector3();
+const _otherTan = new THREE.Vector3();
+const _otherRight = new THREE.Vector3();
+const _otherUp = new THREE.Vector3();
 
 function detectSoftwareWebGL() {
   try {
@@ -117,6 +146,7 @@ export function RacingGame({
   const [telemetry, setTelemetry] = useState<Telemetry>(initialTelemetry);
   const [muted, setMuted] = useState(false);
   const [musicEnabled, setMusicEnabled] = useState(true);
+  const [headlightsOn, setHeadlightsOn] = useState(true);
   const [volume, setVolume] = useState(55);
   const [contextLost, setContextLost] = useState(false);
 
@@ -124,9 +154,12 @@ export function RacingGame({
   const audioRef = useRef<RacingAudioEngine | null>(null);
   const pausedRef = useRef(paused);
   const modeRef = useRef(mode);
+  const headlightsOnRef = useRef(headlightsOn);
+  const skipIntroRef = useRef<(() => void) | null>(null);
 
   pausedRef.current = paused;
   modeRef.current = mode;
+  headlightsOnRef.current = headlightsOn;
 
   const trackData = useMemo(() => createTrackData(), []);
   const minimapPath = useMemo(() => {
@@ -156,6 +189,22 @@ export function RacingGame({
   useEffect(() => {
     audioRef.current?.setSettings(muted, volume, musicEnabled);
   }, [muted, volume, musicEnabled]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat || e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.code === "KeyM") {
+        setMuted((prev) => !prev);
+      } else if (e.code === "KeyL") {
+        setHeadlightsOn((prev) => !prev);
+      } else if (e.code === "Space" && skipIntroRef.current) {
+        e.preventDefault();
+        skipIntroRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // Mount WebGL scene once per raceId / mode reset
   useEffect(() => {
@@ -229,7 +278,7 @@ export function RacingGame({
     const playerRig = createRacerCarMesh(CAR_LIVERIES.player);
     scene.add(playerRig.root);
 
-    // Rival AI racers (active in RACE mode, optional cruising in FREE DRIVE)
+    // Rival AI racers on staggered 2x2 starting grid ahead of player (active in RACE and FREE DRIVE)
     const rivals: RivalState[] =
       mode === "TIME TRIAL"
         ? []
@@ -238,33 +287,54 @@ export function RacingGame({
               id: "cobalt",
               name: CAR_LIVERIES.cobalt.name,
               color: "#3b82f6",
-              distance: 14,
-              lateral: -4.2,
-              targetLateral: -4.2,
+              distance: 19.5,
+              lateral: -3.2,
+              targetLateral: -3.2,
               speed: 0,
-              baseSpeed: mode === "FREE DRIVE" ? 46 : 63.5,
+              baseSpeed: mode === "FREE DRIVE" ? 48 : 64.5,
+              steerAngle: 0,
+              braking: false,
+              worldX: 0,
+              worldY: 0,
+              worldZ: 0,
+              tanX: 0,
+              tanZ: -1,
               rig: createRacerCarMesh(CAR_LIVERIES.cobalt),
             },
             {
               id: "amber",
               name: CAR_LIVERIES.amber.name,
               color: "#f59e0b",
-              distance: 26,
-              lateral: 3.8,
-              targetLateral: 3.8,
+              distance: 13.0,
+              lateral: 3.2,
+              targetLateral: 3.2,
               speed: 0,
-              baseSpeed: mode === "FREE DRIVE" ? 50 : 61.5,
+              baseSpeed: mode === "FREE DRIVE" ? 51 : 62.5,
+              steerAngle: 0,
+              braking: false,
+              worldX: 0,
+              worldY: 0,
+              worldZ: 0,
+              tanX: 0,
+              tanZ: -1,
               rig: createRacerCarMesh(CAR_LIVERIES.amber),
             },
             {
               id: "emerald",
               name: CAR_LIVERIES.emerald.name,
               color: "#10b981",
-              distance: 38,
-              lateral: -1.2,
-              targetLateral: -1.2,
+              distance: 6.5,
+              lateral: -3.2,
+              targetLateral: -3.2,
               speed: 0,
-              baseSpeed: mode === "FREE DRIVE" ? 42 : 59.5,
+              baseSpeed: mode === "FREE DRIVE" ? 45 : 60.5,
+              steerAngle: 0,
+              braking: false,
+              worldX: 0,
+              worldY: 0,
+              worldZ: 0,
+              tanX: 0,
+              tanZ: -1,
               rig: createRacerCarMesh(CAR_LIVERIES.emerald),
             },
           ];
@@ -276,8 +346,8 @@ export function RacingGame({
     }
 
     const startSample = trackData.samples[0];
-    const startX = startSample.position.x + startSample.right.x * 2.2;
-    const startZ = startSample.position.z + startSample.right.z * 2.2;
+    const startX = startSample.position.x + startSample.right.x * 3.2;
+    const startZ = startSample.position.z + startSample.right.z * 3.2;
     const startYaw = Math.atan2(-startSample.tangent.x, -startSample.tangent.z);
 
     const playerState = {
@@ -300,6 +370,9 @@ export function RacingGame({
     };
 
     const raceState = {
+      phase: "INTRO" as RacePhase,
+      introTime: 0,
+      goBannerTimer: 0,
       time: 0,
       lapStartTime: 0,
       lastLap: 1,
@@ -312,26 +385,69 @@ export function RacingGame({
       collisionCooldown: 0,
     };
 
+    const triggerSkipIntro = () => {
+      if (raceState.phase !== "INTRO") return;
+      raceState.phase = "COUNTDOWN";
+      raceState.introTime = INTRO_DURATION;
+      raceState.countdown = 3.2;
+      raceState.lastBeep = 4;
+      raceState.publishAt = 1; // publish immediately on next tick
+      skipIntroRef.current = null;
+    };
+    skipIntroRef.current = triggerSkipIntro;
+
+    const MAX_WHEEL_STEER_RAD = THREE.MathUtils.degToRad(33);
+
     const updateRigVisuals = (
       rig: RacerCarRig,
       slipYaw: number,
       rollTilt: number,
       steerWheelAngle: number,
       wheelSpeed: number,
+      headlights: boolean,
       braking: boolean,
+      reversing: boolean,
       nitro: boolean,
       drifting: boolean,
       delta: number,
     ) => {
       rig.bodyTiltGroup.rotation.y = THREE.MathUtils.damp(rig.bodyTiltGroup.rotation.y, slipYaw, 10, delta);
       rig.bodyTiltGroup.rotation.z = THREE.MathUtils.damp(rig.bodyTiltGroup.rotation.z, rollTilt, 10, delta);
+
+      const steerLerp = 1 - Math.exp(-12 * delta);
+      const clampedSteer = THREE.MathUtils.clamp(steerWheelAngle, -MAX_WHEEL_STEER_RAD, MAX_WHEEL_STEER_RAD);
       rig.frontWheels.forEach((fw) => {
-        fw.rotation.y = THREE.MathUtils.damp(fw.rotation.y, steerWheelAngle, 14, delta);
+        fw.rotation.y = THREE.MathUtils.lerp(fw.rotation.y, clampedSteer, steerLerp);
       });
+
+      const angularVelocity = wheelSpeed / Math.max(0.2, rig.wheelRadius);
       rig.allWheels.forEach((w) => {
-        w.rotation.x -= wheelSpeed * delta * 2.4;
+        w.rotation.x -= angularVelocity * delta;
       });
-      rig.brakeMaterial.emissiveIntensity = braking ? 3.4 : 0.9;
+
+      const lightLerp = 1 - Math.exp(-18 * delta);
+      rig.headlightMaterial.emissiveIntensity = THREE.MathUtils.lerp(
+        rig.headlightMaterial.emissiveIntensity,
+        headlights ? 4.2 : 0.08,
+        lightLerp,
+      );
+      rig.headlightBeams.visible = headlights;
+      rig.headlightSpots.forEach((spot) => {
+        spot.intensity = headlights ? 42 : 0;
+      });
+
+      const targetBrakeIntensity = braking ? 4.8 : headlights ? 0.95 : 0.25;
+      rig.brakeMaterial.emissiveIntensity = THREE.MathUtils.lerp(
+        rig.brakeMaterial.emissiveIntensity,
+        targetBrakeIntensity,
+        lightLerp,
+      );
+      rig.reverseMaterial.emissiveIntensity = THREE.MathUtils.lerp(
+        rig.reverseMaterial.emissiveIntensity,
+        reversing ? 4.6 : 0,
+        lightLerp,
+      );
+
       rig.nitroFlames.forEach((f) => {
         f.visible = nitro;
         if (nitro) f.scale.setScalar(0.85 + Math.random() * 0.35);
@@ -346,6 +462,7 @@ export function RacingGame({
       rollTilt: number,
       steerWheelAngle: number,
       speed: number,
+      braking: boolean,
       nitro: boolean,
       delta: number,
     ) => {
@@ -354,7 +471,7 @@ export function RacingGame({
       _basis.makeBasis(_right, _up, _negTan);
       rig.root.position.copy(_pos).addScaledVector(_right, lateral);
       rig.root.quaternion.setFromRotationMatrix(_basis);
-      updateRigVisuals(rig, 0, rollTilt, steerWheelAngle, speed, false, nitro, false, delta);
+      updateRigVisuals(rig, 0, rollTilt, steerWheelAngle, speed, true, braking, false, nitro, false, delta);
     };
 
     const placePlayerInWorld = (
@@ -368,7 +485,9 @@ export function RacingGame({
       rollTilt: number,
       steerWheelAngle: number,
       wheelSpeed: number,
+      headlights: boolean,
       braking: boolean,
+      reversing: boolean,
       nitro: boolean,
       drifting: boolean,
       delta: number,
@@ -382,7 +501,19 @@ export function RacingGame({
 
       rig.root.position.set(x, y, z);
       rig.root.quaternion.setFromRotationMatrix(_basis);
-      updateRigVisuals(rig, slipYaw, rollTilt, steerWheelAngle, wheelSpeed, braking, nitro, drifting, delta);
+      updateRigVisuals(
+        rig,
+        slipYaw,
+        rollTilt,
+        steerWheelAngle,
+        wheelSpeed,
+        headlights,
+        braking,
+        reversing,
+        nitro,
+        drifting,
+        delta,
+      );
     };
 
     // Initial placement before first frame
@@ -397,24 +528,26 @@ export function RacingGame({
       0,
       0,
       0,
+      headlightsOnRef.current,
+      false,
       false,
       false,
       false,
       0.016,
     );
-    rivals.forEach((r) => placeRivalOnTrack(r.rig, r.distance, r.lateral, 0, 0, 0, false, 0.016));
+    rivals.forEach((r) => placeRivalOnTrack(r.rig, r.distance, r.lateral, 0, 0, 0, false, false, 0.016));
 
-    // Set initial camera right behind player facing their world heading
-    _carFwd.set(-Math.sin(playerState.yaw), 0, -Math.cos(playerState.yaw));
+    // Set initial camera at Phase 1 aerial drone starting point
+    const introStartDist = trackData.lapLength - 130;
+    trackData.sampleAt(introStartDist, _introPos, _introTan, _introRight, _introUp);
+    camera.fov = 54;
+    camera.updateProjectionMatrix();
     camera.position
-      .set(playerState.x, playerState.y, playerState.z)
-      .addScaledVector(_carFwd, -8.8)
-      .addScaledVector(startSample.up, 3.35);
-    camera.lookAt(
-      playerState.x + _carFwd.x * 20,
-      playerState.y + 1.1,
-      playerState.z + _carFwd.z * 20,
-    );
+      .copy(_introPos)
+      .addScaledVector(_introUp, 30)
+      .addScaledVector(_introRight, -12);
+    trackData.sampleAt(introStartDist + 42, _otherPos, _otherTan, _otherRight, _otherUp);
+    camera.lookAt(_otherPos.x, _otherPos.y + 1.5, _otherPos.z);
 
     const onResize = () => {
       if (!container) return;
@@ -468,14 +601,34 @@ export function RacingGame({
       const isPaused = pausedRef.current;
 
       if (!isPaused && !raceState.finished) {
-        raceState.countdown = Math.max(0, raceState.countdown - delta);
-        const ceilCountdown = Math.ceil(raceState.countdown);
-        if (ceilCountdown < raceState.lastBeep && ceilCountdown >= 0) {
-          raceState.lastBeep = ceilCountdown;
-          audioRef.current?.playCountdownBeep(ceilCountdown === 0);
+        if (raceState.phase === "INTRO") {
+          raceState.introTime += delta;
+          if (input.pressed("HANDBRAKE") || raceState.introTime >= INTRO_DURATION) {
+            raceState.phase = "COUNTDOWN";
+            raceState.introTime = INTRO_DURATION;
+            raceState.countdown = 3.2;
+            raceState.lastBeep = 4;
+            raceState.publishAt = 1;
+            skipIntroRef.current = null;
+          }
+        } else if (raceState.phase === "COUNTDOWN") {
+          raceState.countdown = Math.max(0, raceState.countdown - delta);
+          const ceilCountdown = Math.ceil(raceState.countdown);
+          if (ceilCountdown < raceState.lastBeep && ceilCountdown >= 0) {
+            raceState.lastBeep = ceilCountdown;
+            audioRef.current?.playCountdownBeep(ceilCountdown === 0);
+            raceState.publishAt = 1;
+          }
+          if (raceState.countdown <= 0) {
+            raceState.phase = "RACING";
+            raceState.goBannerTimer = 0.85;
+            raceState.publishAt = 1;
+          }
+        } else if (raceState.goBannerTimer > 0) {
+          raceState.goBannerTimer = Math.max(0, raceState.goBannerTimer - delta);
         }
 
-        const active = raceState.countdown === 0;
+        const active = raceState.phase === "RACING";
         const accelerating = active && input.pressed("ACCELERATE");
         const braking = active && input.pressed("BRAKE");
         const handbrake = active && input.pressed("HANDBRAKE");
@@ -581,10 +734,12 @@ export function RacingGame({
               playerState.yaw += yawDiff * Math.min(0.45, impactSeverity * 0.65);
             }
 
-            if (-vn > 6 && raceState.collisionCooldown <= 0) {
-              playerState.shake = 0.28 + impactSeverity * 0.2;
-              raceState.collisionCooldown = 0.42;
-              audioRef.current?.playCollision(0.55 + impactSeverity * 0.45);
+            const impactVel = -vn;
+            if (impactVel > 2.8 && raceState.collisionCooldown <= 0) {
+              const scaledImpact = THREE.MathUtils.clamp((impactVel - 2.5) / 38, 0.14, 1);
+              playerState.shake = 0.12 + scaledImpact * 0.36;
+              raceState.collisionCooldown = 0.24;
+              audioRef.current?.playCollision(scaledImpact);
             }
           }
 
@@ -631,27 +786,62 @@ export function RacingGame({
           }
         }
 
-        // Update AI Rival Racers and compute true XZ car-to-car collisions
-        for (const rival of rivals) {
+        // Update AI Rival Racers (lookahead corner braking, overtaking, steering sync, and XZ collisions)
+        const rivalAudioInputs: RivalAudioInput[] = [];
+        for (let i = 0; i < rivals.length; i++) {
+          const rival = rivals[i];
           if (active) {
-            const curvature = Math.abs(trackData.sampleAt(rival.distance + 22, _pos, _tan, _right, _up));
-            const cornerFactor = THREE.MathUtils.clamp(1 - curvature * 0.42, 0.72, 1.0);
+            const localCurv = trackData.sampleAt(rival.distance + 4, _pos, _tan, _right, _up);
+            const curv16 = Math.abs(trackData.sampleAt(rival.distance + 16, _pos, _tan, _right, _up));
+            const curv34 = Math.abs(trackData.sampleAt(rival.distance + 34, _pos, _tan, _right, _up));
+            const curv54 = Math.abs(trackData.sampleAt(rival.distance + 54, _pos, _tan, _right, _up));
+            const maxAheadCurv = Math.max(curv16, curv34, curv54 * 0.85);
+            const cornerFactor = THREE.MathUtils.clamp(1 - maxAheadCurv * 0.56, 0.58, 1.0);
+
+            const paceWave = Math.sin(raceState.time * 0.45 + i * 2.1) * 1.6;
             const gapToPlayer = playerState.progressDistance - rival.distance;
             const rubberBand = mode === "RACE" ? THREE.MathUtils.clamp(gapToPlayer * 0.08, -4.5, 6.5) : 0;
-            const targetSpeed = (rival.baseSpeed + rubberBand) * cornerFactor;
+            let targetSpeed = (rival.baseSpeed + rubberBand + paceWave) * cornerFactor;
 
-            rival.speed = THREE.MathUtils.damp(rival.speed, targetSpeed, 2.5, delta);
-            rival.distance += rival.speed * delta;
+            // Check overtaking opportunity against player and other AI rivals
+            let blockerLat: number | null = null;
+            let closestGap = 22;
 
-            const distDiff = rival.distance - playerState.progressDistance;
-            if (Math.abs(distDiff) < 16 && Math.abs(rival.lateral - proj.signedLateral) < 3.4) {
-              rival.targetLateral = proj.signedLateral > 0 ? -5.2 : 5.2;
-            } else if (Math.abs(distDiff) > 28) {
-              const curveSign = Math.sign(trackData.sampleAt(rival.distance + 18, _pos, _tan, _right, _up));
-              rival.targetLateral = THREE.MathUtils.clamp(curveSign * 4.5, -6.5, 6.5);
+            const playerGap = playerState.progressDistance - rival.distance;
+            if (playerGap > 0 && playerGap < closestGap && Math.abs(rival.lateral - proj.signedLateral) < 3.5) {
+              closestGap = playerGap;
+              blockerLat = proj.signedLateral;
+            }
+            for (let j = 0; j < rivals.length; j++) {
+              if (i === j) continue;
+              const other = rivals[j];
+              const gap = other.distance - rival.distance;
+              if (gap > 0 && gap < closestGap && Math.abs(rival.lateral - other.lateral) < 3.4) {
+                closestGap = gap;
+                blockerLat = other.lateral;
+              }
             }
 
-            rival.lateral = THREE.MathUtils.damp(rival.lateral, rival.targetLateral, 2.2, delta);
+            if (blockerLat !== null) {
+              rival.targetLateral = blockerLat > 0 ? -5.8 : 5.8;
+              if (closestGap < 8.5 && Math.abs(rival.lateral - blockerLat) < 2.6) {
+                targetSpeed = Math.min(targetSpeed, Math.max(24, rival.speed * 0.88));
+              }
+            } else {
+              const apexSign = Math.sign(trackData.sampleAt(rival.distance + 20, _pos, _tan, _right, _up));
+              const preferredLane = apexSign !== 0 ? apexSign * 4.8 : (i - 1) * 2.8;
+              rival.targetLateral = THREE.MathUtils.clamp(preferredLane, -6.5, 6.5);
+            }
+
+            rival.braking = targetSpeed < rival.speed - 1.8;
+            const dampRate = rival.braking ? 4.2 : 2.3;
+            rival.speed = THREE.MathUtils.damp(rival.speed, targetSpeed, dampRate, delta);
+            rival.distance += rival.speed * delta;
+            rival.lateral = THREE.MathUtils.damp(rival.lateral, rival.targetLateral, 2.5, delta);
+
+            const trackSteer = THREE.MathUtils.clamp(-localCurv * 1.4, -0.45, 0.45);
+            const laneSteer = THREE.MathUtils.clamp(-(rival.targetLateral - rival.lateral) * 0.085, -0.25, 0.25);
+            rival.steerAngle = trackSteer + laneSteer;
 
             // Real XZ distance check against player's free world coordinates
             trackData.sampleAt(rival.distance, _pos, _tan, _right, _up);
@@ -665,6 +855,10 @@ export function RacingGame({
               const nx = dx / dist;
               const nz = dz / dist;
               const push = minCarSep - dist;
+              const rivalVx = _tan.x * rival.speed;
+              const rivalVz = _tan.z * rival.speed;
+              const relClosingVel = Math.max(0, -((playerState.vx - rivalVx) * nx + (playerState.vz - rivalVz) * nz));
+
               playerState.x += nx * push * 0.65;
               playerState.z += nz * push * 0.65;
               playerState.vx += nx * 8.5;
@@ -674,20 +868,34 @@ export function RacingGame({
               rival.speed = Math.max(16, rival.speed * 0.94);
 
               if (raceState.collisionCooldown <= 0) {
-                playerState.shake = 0.34;
-                raceState.collisionCooldown = 0.42;
-                audioRef.current?.playCollision(0.9);
+                const impactIntensity = THREE.MathUtils.clamp(Math.max(4, relClosingVel) / 34, 0.18, 1);
+                playerState.shake = 0.14 + impactIntensity * 0.28;
+                raceState.collisionCooldown = 0.28;
+                audioRef.current?.playCollision(impactIntensity);
               }
             }
+          } else {
+            // Pre-race grid hold: brakes lit, front wheels centered
+            rival.braking = true;
+            rival.steerAngle = 0;
           }
+
+          trackData.sampleAt(rival.distance, _pos, _tan, _right, _up);
+          _rivalPos.copy(_pos).addScaledVector(_right, rival.lateral);
+          rival.worldX = _rivalPos.x;
+          rival.worldY = _rivalPos.y;
+          rival.worldZ = _rivalPos.z;
+          rival.tanX = _tan.x;
+          rival.tanZ = _tan.z;
 
           placeRivalOnTrack(
             rival.rig,
             rival.distance,
             rival.lateral,
             (rival.targetLateral - rival.lateral) * 0.025,
-            (rival.targetLateral - rival.lateral) * 0.08,
+            rival.steerAngle,
             rival.speed,
+            rival.braking,
             rival.speed > 66,
             delta,
           );
@@ -697,7 +905,13 @@ export function RacingGame({
         const finalProj = trackData.projectOntoTrack(playerState.x, playerState.z, playerState.trackIndex);
         playerState.y = THREE.MathUtils.damp(playerState.y, finalProj.position.y, 18, delta);
 
-        const signedWheelSpeed = forwardSpeed >= -0.5 ? playerState.speed : -playerState.speed;
+        const introFlash =
+          raceState.phase === "INTRO" &&
+          ((raceState.introTime > 3.4 && raceState.introTime < 3.62) ||
+            (raceState.introTime > 3.82 && raceState.introTime < 4.04));
+        const effectiveHeadlights = introFlash ? !headlightsOnRef.current : headlightsOnRef.current;
+        const brakeLightActive = raceState.phase !== "RACING" || (braking && forwardSpeed > 0.2) || handbrake;
+        const reverseLightActive = active && (forwardSpeed < -0.5 || (braking && forwardSpeed <= 0.5));
         const visualSlip = playerState.drifting ? -steering * 0.24 : -steering * 0.05;
         placePlayerInWorld(
           playerRig,
@@ -708,9 +922,11 @@ export function RacingGame({
           finalProj.up,
           visualSlip,
           steering * (playerState.drifting ? 0.14 : 0.055),
-          -steering * 0.42,
-          signedWheelSpeed,
-          braking,
+          -steering * MAX_WHEEL_STEER_RAD,
+          forwardSpeed,
+          effectiveHeadlights,
+          brakeLightActive,
+          reverseLightActive,
           canNitro,
           playerState.drifting,
           delta,
@@ -721,45 +937,176 @@ export function RacingGame({
         keyLight.target.position.set(playerState.x, playerState.y, playerState.z);
         keyLight.target.updateMatrixWorld();
 
-        // Smooth dynamic chase camera strictly following player's actual world heading (no track snapping)
-        const desiredFov = 58 + (playerState.speed / 96) * 14 + (canNitro ? 5 : 0);
-        if (Math.abs(camera.fov - desiredFov) > 0.1) {
-          camera.fov = THREE.MathUtils.damp(camera.fov, desiredFov, 6, delta);
-          camera.updateProjectionMatrix();
-        }
-
-        const shakeX =
-          playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
-        const shakeY =
-          playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
-
+        // Player basis vectors for chase camera & spatial audio listener
         _carFwd.set(-Math.sin(playerState.yaw), 0, -Math.cos(playerState.yaw));
         _carRight.set(Math.cos(playerState.yaw), 0, -Math.sin(playerState.yaw));
-        _camTarget
+
+        _chasePos
           .set(playerState.x, playerState.y, playerState.z)
           .addScaledVector(_carFwd, -8.8)
-          .addScaledVector(finalProj.up, 3.35 + shakeY)
-          .addScaledVector(_carRight, shakeX);
-        camera.position.lerp(_camTarget, 1 - Math.exp(-9.5 * delta));
-
-        _camLook
+          .addScaledVector(finalProj.up, 3.35);
+        _chaseLook
           .set(playerState.x, playerState.y, playerState.z)
           .addScaledVector(_carFwd, 18)
           .addScaledVector(finalProj.up, 1.15);
-        camera.lookAt(_camLook);
 
-        const brakingDecel = braking && forwardSpeed > 1.5;
-        const reversingThrottle = braking && forwardSpeed <= 1.5;
-        audioRef.current?.updateTelemetry(
-          playerState.speed,
-          accelerating || reversingThrottle,
-          brakingDecel,
-          canNitro,
-          playerState.drifting,
-          false,
-        );
+        if (raceState.phase === "INTRO") {
+          const t = raceState.introTime;
+          if (t < 2.7) {
+            // Phase 1: Aerial/drone flyover sweeping toward and just ahead of the starting grid
+            const u = THREE.MathUtils.smoothstep(t / 2.7, 0, 1);
+            const camDist = trackData.lapLength - THREE.MathUtils.lerp(130, -29, u);
+            trackData.sampleAt(camDist, _introPos, _introTan, _introRight, _introUp);
+            camera.position
+              .copy(_introPos)
+              .addScaledVector(_introUp, THREE.MathUtils.lerp(30, 5.4, u))
+              .addScaledVector(_introRight, THREE.MathUtils.lerp(-12, 8.2, u));
+
+            const lookDist = THREE.MathUtils.lerp(trackData.lapLength - 88, trackData.lapLength + 10, u);
+            trackData.sampleAt(lookDist, _otherPos, _otherTan, _otherRight, _otherUp);
+            _camLook.copy(_otherPos).addScaledVector(_otherUp, THREE.MathUtils.lerp(1.5, 1.0, u));
+            camera.lookAt(_camLook);
+            camera.fov = THREE.MathUtils.lerp(54, 50, u);
+            camera.updateProjectionMatrix();
+          } else if (t < 4.9) {
+            // Phase 2: Low grid dolly past the 3 rivals settling onto a low front-3/4 hero shot of player
+            const u = THREE.MathUtils.smoothstep((t - 2.7) / 2.2, 0, 1);
+            const startGridDist = 29;
+            trackData.sampleAt(startGridDist, _introPos, _introTan, _introRight, _introUp);
+            _introPos.addScaledVector(_introUp, 5.4).addScaledVector(_introRight, 8.2);
+
+            _heroPos
+              .set(playerState.x, playerState.y, playerState.z)
+              .addScaledVector(_carFwd, 5.2)
+              .addScaledVector(_carRight, 3.1)
+              .addScaledVector(finalProj.up, 1.15);
+            _heroLook
+              .set(playerState.x, playerState.y, playerState.z)
+              .addScaledVector(finalProj.up, 0.72);
+
+            // Arc gracefully along the right side of the grid at low eye level
+            const midArc = Math.sin(u * Math.PI);
+            camera.position.lerpVectors(_introPos, _heroPos, u);
+            camera.position.y -= midArc * 2.1;
+            camera.position.addScaledVector(_carRight, midArc * 2.6);
+
+            trackData.sampleAt(10, _otherPos, _otherTan, _otherRight, _otherUp);
+            _otherPos.addScaledVector(_otherUp, 1.0);
+            _camLook.lerpVectors(_otherPos, _heroLook, u);
+            camera.lookAt(_camLook);
+            camera.fov = THREE.MathUtils.lerp(50, 48, u);
+            camera.updateProjectionMatrix();
+          } else {
+            // Phase 3: Cubic ease-in-out sweep around the side of the player car into the chase camera
+            const raw = THREE.MathUtils.clamp((t - 4.9) / (INTRO_DURATION - 4.9), 0, 1);
+            const e = raw < 0.5 ? 4 * raw * raw * raw : 1 - Math.pow(-2 * raw + 2, 3) / 2;
+
+            _heroPos
+              .set(playerState.x, playerState.y, playerState.z)
+              .addScaledVector(_carFwd, 5.2)
+              .addScaledVector(_carRight, 3.1)
+              .addScaledVector(finalProj.up, 1.15);
+            _heroLook
+              .set(playerState.x, playerState.y, playerState.z)
+              .addScaledVector(finalProj.up, 0.72);
+
+            camera.position.lerpVectors(_heroPos, _chasePos, e);
+            camera.position.addScaledVector(_carRight, Math.sin(e * Math.PI) * 3.1);
+            _camLook.lerpVectors(_heroLook, _chaseLook, e);
+            camera.lookAt(_camLook);
+            camera.fov = THREE.MathUtils.lerp(48, 58, e);
+            camera.updateProjectionMatrix();
+          }
+        } else {
+          // Gameplay & countdown chase camera
+          const desiredFov = 58 + (playerState.speed / 96) * 14 + (canNitro ? 5 : 0);
+          if (Math.abs(camera.fov - desiredFov) > 0.1) {
+            camera.fov = THREE.MathUtils.damp(camera.fov, desiredFov, 6, delta);
+            camera.updateProjectionMatrix();
+          }
+
+          const shakeX =
+            playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
+          const shakeY =
+            playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
+
+          _camTarget
+            .copy(_chasePos)
+            .addScaledVector(finalProj.up, shakeY)
+            .addScaledVector(_carRight, shakeX);
+          camera.position.lerp(_camTarget, 1 - Math.exp(-9.5 * delta));
+          camera.lookAt(_chaseLook);
+        }
+
+        // Compute 3D spatial audio parameters for each AI rival
+        let listVx = playerState.vx;
+        let listVz = playerState.vz;
+        if (raceState.phase === "INTRO") {
+          _listenerPos.copy(camera.position);
+          camera.getWorldDirection(_listenerFwd);
+          _listenerFwd.y = 0;
+          if (_listenerFwd.lengthSq() > 1e-4) _listenerFwd.normalize();
+          _listenerRight.set(-_listenerFwd.z, 0, _listenerFwd.x);
+          listVx = 0;
+          listVz = 0;
+        } else {
+          _listenerPos.set(playerState.x, playerState.y, playerState.z);
+          _listenerFwd.copy(_carFwd);
+          _listenerRight.copy(_carRight);
+        }
+
+        for (let i = 0; i < rivals.length; i++) {
+          const rival = rivals[i];
+          _relVec.set(rival.worldX - _listenerPos.x, rival.worldY - _listenerPos.y, rival.worldZ - _listenerPos.z);
+          const dist = _relVec.length();
+          const pan = _relVec.dot(_listenerRight) / 14;
+          const frontDot = dist > 0.1 ? _relVec.dot(_listenerFwd) / dist : 0;
+          const rivalVx = rival.tanX * rival.speed;
+          const rivalVz = rival.tanZ * rival.speed;
+          const relClosing =
+            dist > 0.2 ? -(((rivalVx - listVx) * _relVec.x + (rivalVz - listVz) * _relVec.z) / dist) : 0;
+          const dopplerFactor = THREE.MathUtils.clamp(1 + relClosing / 320, 0.9, 1.12);
+          rivalAudioInputs.push({
+            speed: rival.speed,
+            distance: dist,
+            pan,
+            frontDot,
+            dopplerFactor,
+          });
+        }
+
+        const brakingDecel = active && braking && forwardSpeed > 1.5;
+        const reversingThrottle = active && braking && forwardSpeed <= 1.5;
+        const latAccel = Math.abs(steering) * turnRate * steerScale * absForward;
+        const cornerSlip =
+          absForward > 20 && latAccel > 38 ? THREE.MathUtils.clamp((latAccel - 38) / 36, 0, 1) : 0;
+        const lateralSkid =
+          playerState.speed > 10 && Math.abs(lateralSpeed) > 5.5
+            ? THREE.MathUtils.clamp((Math.abs(lateralSpeed) - 5.5) / 14, 0, 1)
+            : 0;
+        const driftIntensity = playerState.drifting
+          ? THREE.MathUtils.clamp(0.55 + Math.abs(steering) * 0.35 + (absForward / 70) * 0.25, 0.45, 1)
+          : 0;
+        const tireSlip = Math.max(driftIntensity, cornerSlip, lateralSkid);
+
+        audioRef.current?.updateTelemetry({
+          speed: playerState.speed,
+          accelerating: accelerating || reversingThrottle,
+          braking: brakingDecel,
+          nitroActive: canNitro,
+          tireSlip,
+          paused: false,
+          rivals: rivalAudioInputs,
+        });
       } else {
-        audioRef.current?.updateTelemetry(0, false, false, false, false, true);
+        audioRef.current?.updateTelemetry({
+          speed: 0,
+          accelerating: false,
+          braking: false,
+          nitroActive: false,
+          tireSlip: 0,
+          paused: true,
+        });
       }
 
       renderer.render(scene, camera);
@@ -781,7 +1128,9 @@ export function RacingGame({
           totalRacers: 1 + rivals.length,
           time: raceState.time,
           bestLap: raceState.bestLap,
+          phase: raceState.phase,
           countdown: Math.ceil(raceState.countdown),
+          showGo: raceState.goBannerTimer > 0,
           drifting: playerState.drifting,
           wrongWay: playerState.wrongWay,
           finished: raceState.finished,
@@ -806,6 +1155,7 @@ export function RacingGame({
 
     return () => {
       disposed = true;
+      skipIntroRef.current = null;
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       playerRig.dispose();
@@ -827,9 +1177,15 @@ export function RacingGame({
     setRaceId((id) => id + 1);
   };
 
+  const handleCanvasTap = () => {
+    if (telemetry.phase === "INTRO" && !paused) {
+      skipIntroRef.current?.();
+    }
+  };
+
   return (
     <main className="racing-shell">
-      <div className="racing-canvas-mount" ref={canvasMountRef} />
+      <div className="racing-canvas-mount" ref={canvasMountRef} onClick={handleCanvasTap} />
 
       {contextLost && (
         <div className="race-overlay">
@@ -849,7 +1205,8 @@ export function RacingGame({
         </div>
       )}
 
-      <header className="race-topbar">
+      {(telemetry.phase !== "INTRO" || paused) && (
+        <header className="race-topbar">
         <button className="race-back" onClick={onExit}>
           <ArrowLeft size={16} />
           <span>Console</span>
@@ -868,6 +1225,15 @@ export function RacingGame({
         </div>
 
         <div className="race-controls">
+          <button
+            className="hud-icon-btn"
+            onClick={() => setHeadlightsOn((prev) => !prev)}
+            title={headlightsOn ? "Turn off headlights (L)" : "Turn on headlights (L)"}
+            aria-label="Toggle headlights"
+          >
+            <Lightbulb size={15} />
+            <span>{headlightsOn ? "Lights On" : "Lights Off"}</span>
+          </button>
           <button
             className="hud-icon-btn"
             onClick={() => setMusicEnabled((prev) => !prev)}
@@ -894,64 +1260,89 @@ export function RacingGame({
           </button>
         </div>
       </header>
+      )}
 
-      <aside className="race-minimap-panel" aria-label="Circuit map and standings">
-        <svg viewBox="0 0 100 100" className="minimap-svg">
-          <path d={minimapPath} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth="4.5" strokeLinejoin="round" />
-          <path d={minimapPath} fill="none" stroke="#f4f2ec" strokeWidth="1.4" strokeLinejoin="round" />
-          {telemetry.dots.map((dot) => (
-            <circle
-              key={dot.id}
-              cx={dot.x}
-              cy={dot.y}
-              r={dot.isPlayer ? 4.4 : 3.2}
-              fill={dot.color}
-              stroke="#0a0b0e"
-              strokeWidth="1.2"
-            />
-          ))}
-        </svg>
-        <div className="minimap-stats">
-          {mode === "RACE" && (
-            <div>
-              <small>POS</small>
-              <strong className="tabular-nums">
-                {telemetry.position} / {telemetry.totalRacers}
-              </strong>
+      {(telemetry.phase !== "INTRO" || paused) && (
+        <>
+          <aside className="race-minimap-panel" aria-label="Circuit map and standings">
+            <svg viewBox="0 0 100 100" className="minimap-svg">
+              <path d={minimapPath} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth="4.5" strokeLinejoin="round" />
+              <path d={minimapPath} fill="none" stroke="#f4f2ec" strokeWidth="1.4" strokeLinejoin="round" />
+              {telemetry.dots.map((dot) => (
+                <circle
+                  key={dot.id}
+                  cx={dot.x}
+                  cy={dot.y}
+                  r={dot.isPlayer ? 4.4 : 3.2}
+                  fill={dot.color}
+                  stroke="#0a0b0e"
+                  strokeWidth="1.2"
+                />
+              ))}
+            </svg>
+            <div className="minimap-stats">
+              {mode === "RACE" && (
+                <div>
+                  <small>POS</small>
+                  <strong className="tabular-nums">
+                    {telemetry.position} / {telemetry.totalRacers}
+                  </strong>
+                </div>
+              )}
+              <div>
+                <small>{mode === "FREE DRIVE" ? "DRIVE" : "LAP"}</small>
+                <strong className="tabular-nums">{mode === "FREE DRIVE" ? "OPEN" : `${telemetry.lap} / ${TOTAL_LAPS}`}</strong>
+              </div>
+              <div>
+                <small>TIME</small>
+                <strong className="tabular-nums">{formatTime(telemetry.time)}</strong>
+              </div>
             </div>
-          )}
-          <div>
-            <small>{mode === "FREE DRIVE" ? "DRIVE" : "LAP"}</small>
-            <strong className="tabular-nums">{mode === "FREE DRIVE" ? "OPEN" : `${telemetry.lap} / ${TOTAL_LAPS}`}</strong>
-          </div>
-          <div>
-            <small>TIME</small>
-            <strong className="tabular-nums">{formatTime(telemetry.time)}</strong>
-          </div>
-        </div>
-      </aside>
+          </aside>
 
-      <section className="race-hud" aria-label="Vehicle telemetry">
-        <div className="race-speed-dock">
-          <div className="race-speed">
-            <span className="tabular-nums">{String(Math.round(telemetry.speed * 3.6)).padStart(3, "0")}</span>
-            <small>KM/H {telemetry.drifting ? "· DRIFT" : ""}</small>
-          </div>
-          <div className="nitro-meter">
-            <div className="nitro-label">
-              <span>NITRO</span>
-              <b className="tabular-nums">{Math.round(telemetry.nitro)}%</b>
+          <section className="race-hud" aria-label="Vehicle telemetry">
+            <div className="race-speed-dock">
+              <div className="race-speed">
+                <span className="tabular-nums">{String(Math.round(telemetry.speed * 3.6)).padStart(3, "0")}</span>
+                <small>KM/H {telemetry.drifting ? "· DRIFT" : ""}</small>
+              </div>
+              <div className="nitro-meter">
+                <div className="nitro-label">
+                  <span>NITRO</span>
+                  <b className="tabular-nums">{Math.round(telemetry.nitro)}%</b>
+                </div>
+                <div className="nitro-track">
+                  <i style={{ width: `${telemetry.nitro}%` }} />
+                </div>
+              </div>
             </div>
-            <div className="nitro-track">
-              <i style={{ width: `${telemetry.nitro}%` }} />
-            </div>
+          </section>
+        </>
+      )}
+
+      {telemetry.phase === "INTRO" && !paused && (
+        <>
+          <div className="intro-letterbox top" aria-hidden="true" />
+          <div className="intro-letterbox bottom" aria-hidden="true" />
+          <div className="intro-banner">
+            <span className="eyebrow">POYY GRAND PRIX · STARTING GRID</span>
+            <strong>{mode === "TIME TRIAL" ? "TIME TRIAL SOLO RUN" : "4-CAR GRID SHOWDOWN"}</strong>
           </div>
-        </div>
-      </section>
+          <button className="intro-skip-btn" onClick={() => skipIntroRef.current?.()}>
+            <FastForward size={15} />
+            <span>Skip Intro</span>
+            <kbd>SPACE</kbd>
+          </button>
+        </>
+      )}
 
-      {telemetry.countdown > 0 && !paused && <div className="race-countdown tabular-nums">{telemetry.countdown}</div>}
+      {telemetry.phase === "COUNTDOWN" && telemetry.countdown > 0 && !paused && (
+        <div className="race-countdown tabular-nums">{telemetry.countdown}</div>
+      )}
 
-      {telemetry.wrongWay && telemetry.countdown === 0 && !paused && !telemetry.finished && (
+      {telemetry.showGo && !paused && <div className="race-countdown go tabular-nums">GO!</div>}
+
+      {telemetry.wrongWay && telemetry.phase === "RACING" && !paused && !telemetry.finished && (
         <div className="race-wrong-way" role="status">
           WRONG WAY
         </div>
@@ -1006,25 +1397,33 @@ export function RacingGame({
         </div>
       )}
 
-      <footer className="race-help">
-        <span>
-          <kbd>W</kbd> Throttle
-        </span>
-        <span>
-          <kbd>A</kbd>
-          <kbd>D</kbd> or Phone Tilt Steer
-        </span>
-        <span>
-          <kbd>SHIFT</kbd> Nitro
-        </span>
-        <span>
-          <kbd>SPACE</kbd> Drift
-        </span>
-        <span>
-          <kbd>ESC</kbd> Pause
-        </span>
-        <span className="race-link-state">POYY LINK · {socket.connected ? "Connected" : "Reconnecting"}</span>
-      </footer>
+      {(telemetry.phase !== "INTRO" || paused) && (
+        <footer className="race-help">
+          <span>
+            <kbd>W</kbd> Throttle
+          </span>
+          <span>
+            <kbd>A</kbd>
+            <kbd>D</kbd> or Phone Tilt Steer
+          </span>
+          <span>
+            <kbd>SHIFT</kbd> Nitro
+          </span>
+          <span>
+            <kbd>SPACE</kbd> Drift
+          </span>
+          <span>
+            <kbd>L</kbd> Lights
+          </span>
+          <span>
+            <kbd>M</kbd> Mute
+          </span>
+          <span>
+            <kbd>ESC</kbd> Pause
+          </span>
+          <span className="race-link-state">POYY LINK · {socket.connected ? "Connected" : "Reconnecting"}</span>
+        </footer>
+      )}
     </main>
   );
 }
