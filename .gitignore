@@ -1,0 +1,5 @@
+node_modules
+.next
+.next-dev
+node_modules.incomplete
+node_modules.incomplete.2
