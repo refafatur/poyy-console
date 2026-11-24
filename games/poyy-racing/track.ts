@@ -14,11 +14,22 @@ export type TrackSample = {
   curvature: number;
 };
 
+export type TrackProjection = {
+  sampleIndex: number;
+  distance: number;
+  signedLateral: number;
+  position: THREE.Vector3;
+  tangent: THREE.Vector3;
+  right: THREE.Vector3;
+  up: THREE.Vector3;
+};
+
 export type TrackData = {
   curve: THREE.CatmullRomCurve3;
   lapLength: number;
   samples: TrackSample[];
   sampleAt: (distance: number, outPos: THREE.Vector3, outTan: THREE.Vector3, outRight: THREE.Vector3, outUp: THREE.Vector3) => number;
+  projectOntoTrack: (x: number, z: number, hintIndex?: number) => TrackProjection;
   minDistanceToRoadXZ: (x: number, z: number) => number;
   minimapPoints: Array<{ x: number; y: number }>;
 };
@@ -106,6 +117,91 @@ export function createTrackData(): TrackData {
     return Math.sqrt(bestSq);
   };
 
+  const projPos = new THREE.Vector3();
+  const projTan = new THREE.Vector3();
+  const projRight = new THREE.Vector3();
+  const projUp = new THREE.Vector3();
+
+  const projectSegment = (idxA: number, x: number, z: number) => {
+    const a = samples[idxA];
+    const b = samples[(idxA + 1) % sampleCount];
+    const abx = b.position.x - a.position.x;
+    const abz = b.position.z - a.position.z;
+    const abLenSq = abx * abx + abz * abz;
+    const apx = x - a.position.x;
+    const apz = z - a.position.z;
+    const alpha = abLenSq > 1e-6 ? THREE.MathUtils.clamp((apx * abx + apz * abz) / abLenSq, 0, 1) : 0;
+    const cx = a.position.x + abx * alpha;
+    const cz = a.position.z + abz * alpha;
+    const dx = x - cx;
+    const dz = z - cz;
+    return { idxA, alpha, distSq: dx * dx + dz * dz };
+  };
+
+  const projectOntoTrack = (x: number, z: number, hintIndex?: number): TrackProjection => {
+    let bestIdx = 0;
+    let bestSq = Infinity;
+
+    if (hintIndex !== undefined) {
+      const normalizedHint = ((hintIndex % sampleCount) + sampleCount) % sampleCount;
+      for (let offset = -48; offset <= 48; offset++) {
+        const idx = (normalizedHint + offset + sampleCount) % sampleCount;
+        const p = samples[idx].position;
+        const dx = x - p.x;
+        const dz = z - p.z;
+        const dSq = dx * dx + dz * dz;
+        if (dSq < bestSq) {
+          bestSq = dSq;
+          bestIdx = idx;
+        }
+      }
+    }
+
+    if (bestSq > 676) {
+      bestSq = Infinity;
+      for (let i = 0; i < sampleCount; i++) {
+        const p = samples[i].position;
+        const dx = x - p.x;
+        const dz = z - p.z;
+        const dSq = dx * dx + dz * dz;
+        if (dSq < bestSq) {
+          bestSq = dSq;
+          bestIdx = i;
+        }
+      }
+    }
+
+    const prevIdx = (bestIdx - 1 + sampleCount) % sampleCount;
+    const segPrev = projectSegment(prevIdx, x, z);
+    const segNext = projectSegment(bestIdx, x, z);
+    const chosen = segPrev.distSq < segNext.distSq ? segPrev : segNext;
+
+    const i0 = chosen.idxA;
+    const i1 = (i0 + 1) % sampleCount;
+    const s0 = samples[i0];
+    const s1 = samples[i1];
+    const alpha = chosen.alpha;
+
+    projPos.lerpVectors(s0.position, s1.position, alpha);
+    projTan.lerpVectors(s0.tangent, s1.tangent, alpha).normalize();
+    projRight.lerpVectors(s0.right, s1.right, alpha).normalize();
+    projUp.lerpVectors(s0.up, s1.up, alpha).normalize();
+
+    const endDist = i0 === sampleCount - 1 ? lapLength : s1.distance;
+    const distance = THREE.MathUtils.lerp(s0.distance, endDist, alpha);
+    const signedLateral = (x - projPos.x) * projRight.x + (z - projPos.z) * projRight.z;
+
+    return {
+      sampleIndex: i0,
+      distance,
+      signedLateral,
+      position: projPos,
+      tangent: projTan,
+      right: projRight,
+      up: projUp,
+    };
+  };
+
   // Compute normalized 0..100 SVG minimap coordinates
   let minX = Infinity;
   let maxX = -Infinity;
@@ -130,7 +226,7 @@ export function createTrackData(): TrackData {
     });
   }
 
-  return { curve, lapLength, samples, sampleAt, minDistanceToRoadXZ, minimapPoints };
+  return { curve, lapLength, samples, sampleAt, projectOntoTrack, minDistanceToRoadXZ, minimapPoints };
 }
 
 function makeAsphaltTexture(maxAnisotropy: number) {

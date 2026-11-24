@@ -1170,6 +1170,24 @@ a:focus-visible {
   pointer-events: none;
 }
 
+.race-wrong-way {
+  position: absolute;
+  z-index: 5;
+  top: 22%;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 10px 24px;
+  border: 1px solid rgba(248, 113, 113, 0.75);
+  border-radius: 6px;
+  background: rgba(185, 28, 28, 0.88);
+  color: #fff;
+  font-family: var(--font-display), sans-serif;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  pointer-events: none;
+}
+
 .race-overlay {
   position: absolute;
   z-index: 10;

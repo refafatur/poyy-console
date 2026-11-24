@@ -9,7 +9,12 @@ import { useUniversalInputs } from "@/hooks/use-universal-inputs";
 import { RacingAudioEngine } from "@/games/poyy-racing/audio";
 import { CAR_LIVERIES, createRacerCarMesh, type RacerCarRig } from "@/games/poyy-racing/models/carModel";
 import { createCitySkyline } from "@/games/poyy-racing/models/cityBuildings";
-import { createTrackData, createTrackMeshes, ROAD_HALF_WIDTH, type TrackData } from "@/games/poyy-racing/track";
+import {
+  BARRIER_OFFSET,
+  createTrackData,
+  createTrackMeshes,
+  type TrackData,
+} from "@/games/poyy-racing/track";
 
 export type GameMode = "RACE" | "TIME TRIAL" | "FREE DRIVE";
 
@@ -25,6 +30,7 @@ type Telemetry = {
   bestLap: number | null;
   countdown: number;
   drifting: boolean;
+  wrongWay: boolean;
   finished: boolean;
   dots: RacerDot[];
 };
@@ -53,6 +59,7 @@ const initialTelemetry: Telemetry = {
   bestLap: null,
   countdown: 3,
   drifting: false,
+  wrongWay: false,
   finished: false,
   dots: [],
 };
@@ -64,6 +71,10 @@ const _right = new THREE.Vector3();
 const _up = new THREE.Vector3();
 const _basis = new THREE.Matrix4();
 const _negTan = new THREE.Vector3();
+const _carFwd = new THREE.Vector3();
+const _carRight = new THREE.Vector3();
+const _negFwd = new THREE.Vector3();
+const _rivalPos = new THREE.Vector3();
 const _camTarget = new THREE.Vector3();
 const _camLook = new THREE.Vector3();
 
@@ -124,13 +135,14 @@ export function RacingGame({
     return `${pts.map((p, idx) => `${idx === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")} Z`;
   }, [trackData]);
 
-  // Unlock Web Audio on first user gesture or controller socket event
+  // Unlock & preload Lamborghini audio immediately on mount (and resume on user gesture)
   useEffect(() => {
     const audio = new RacingAudioEngine();
     audioRef.current = audio;
     const unlock = () => audio.unlock();
-    window.addEventListener("keydown", unlock, { once: true });
-    window.addEventListener("pointerdown", unlock, { once: true });
+    unlock();
+    window.addEventListener("keydown", unlock);
+    window.addEventListener("pointerdown", unlock);
     socket.on("input:event", unlock);
     return () => {
       window.removeEventListener("keydown", unlock);
@@ -263,11 +275,25 @@ export function RacingGame({
       renderer.compile(scene, camera);
     }
 
+    const startSample = trackData.samples[0];
+    const startX = startSample.position.x + startSample.right.x * 2.2;
+    const startZ = startSample.position.z + startSample.right.z * 2.2;
+    const startYaw = Math.atan2(-startSample.tangent.x, -startSample.tangent.z);
+
     const playerState = {
-      distance: 0,
-      lateral: 2.2,
+      x: startX,
+      y: startSample.position.y,
+      z: startZ,
+      yaw: startYaw,
+      vx: 0,
+      vz: 0,
       speed: 0,
-      heading: 0,
+      trackIndex: 0,
+      trackDistance: 0,
+      prevTrackDistance: 0,
+      progressDistance: 0,
+      wrongWay: false,
+      driftSlipVisual: 0,
       nitro: 100,
       drifting: false,
       shake: 0,
@@ -286,34 +312,26 @@ export function RacingGame({
       collisionCooldown: 0,
     };
 
-    const placeCarOnTrack = (
+    const updateRigVisuals = (
       rig: RacerCarRig,
-      distance: number,
-      lateral: number,
-      yawOffset: number,
+      slipYaw: number,
       rollTilt: number,
       steerWheelAngle: number,
-      speed: number,
+      wheelSpeed: number,
       braking: boolean,
       nitro: boolean,
       drifting: boolean,
       delta: number,
     ) => {
-      trackData.sampleAt(distance, _pos, _tan, _right, _up);
-      _negTan.copy(_tan).negate();
-      _basis.makeBasis(_right, _up, _negTan);
-      rig.root.position.copy(_pos).addScaledVector(_right, lateral);
-      rig.root.quaternion.setFromRotationMatrix(_basis);
-      rig.root.rotateY(yawOffset);
-
+      rig.bodyTiltGroup.rotation.y = THREE.MathUtils.damp(rig.bodyTiltGroup.rotation.y, slipYaw, 10, delta);
       rig.bodyTiltGroup.rotation.z = THREE.MathUtils.damp(rig.bodyTiltGroup.rotation.z, rollTilt, 10, delta);
       rig.frontWheels.forEach((fw) => {
         fw.rotation.y = THREE.MathUtils.damp(fw.rotation.y, steerWheelAngle, 14, delta);
       });
       rig.allWheels.forEach((w) => {
-        w.rotation.x -= speed * delta * 2.4;
+        w.rotation.x -= wheelSpeed * delta * 2.4;
       });
-      rig.brakeMaterial.emissiveIntensity = braking ? 3.2 : 0.9;
+      rig.brakeMaterial.emissiveIntensity = braking ? 3.4 : 0.9;
       rig.nitroFlames.forEach((f) => {
         f.visible = nitro;
         if (nitro) f.scale.setScalar(0.85 + Math.random() * 0.35);
@@ -321,14 +339,82 @@ export function RacingGame({
       rig.driftSmoke.visible = drifting;
     };
 
-    // Initial placement before first frame
-    placeCarOnTrack(playerRig, 0, playerState.lateral, 0, 0, 0, 0, false, false, false, 0.016);
-    rivals.forEach((r) => placeCarOnTrack(r.rig, r.distance, r.lateral, 0, 0, 0, 0, false, false, false, 0.016));
+    const placeRivalOnTrack = (
+      rig: RacerCarRig,
+      distance: number,
+      lateral: number,
+      rollTilt: number,
+      steerWheelAngle: number,
+      speed: number,
+      nitro: boolean,
+      delta: number,
+    ) => {
+      trackData.sampleAt(distance, _pos, _tan, _right, _up);
+      _negTan.copy(_tan).negate();
+      _basis.makeBasis(_right, _up, _negTan);
+      rig.root.position.copy(_pos).addScaledVector(_right, lateral);
+      rig.root.quaternion.setFromRotationMatrix(_basis);
+      updateRigVisuals(rig, 0, rollTilt, steerWheelAngle, speed, false, nitro, false, delta);
+    };
 
-    // Set initial camera right behind player
-    trackData.sampleAt(0, _pos, _tan, _right, _up);
-    camera.position.copy(_pos).addScaledVector(_tan, -10).addScaledVector(_up, 3.8);
-    camera.lookAt(_pos.clone().addScaledVector(_tan, 24));
+    const placePlayerInWorld = (
+      rig: RacerCarRig,
+      x: number,
+      y: number,
+      z: number,
+      yaw: number,
+      surfaceUp: THREE.Vector3,
+      slipYaw: number,
+      rollTilt: number,
+      steerWheelAngle: number,
+      wheelSpeed: number,
+      braking: boolean,
+      nitro: boolean,
+      drifting: boolean,
+      delta: number,
+    ) => {
+      _carFwd.set(-Math.sin(yaw), 0, -Math.cos(yaw));
+      // Project heading onto the road slope plane while keeping world yaw strictly player-controlled
+      _carFwd.addScaledVector(surfaceUp, -_carFwd.dot(surfaceUp)).normalize();
+      _carRight.crossVectors(_carFwd, surfaceUp).normalize();
+      _negFwd.copy(_carFwd).negate();
+      _basis.makeBasis(_carRight, surfaceUp, _negFwd);
+
+      rig.root.position.set(x, y, z);
+      rig.root.quaternion.setFromRotationMatrix(_basis);
+      updateRigVisuals(rig, slipYaw, rollTilt, steerWheelAngle, wheelSpeed, braking, nitro, drifting, delta);
+    };
+
+    // Initial placement before first frame
+    placePlayerInWorld(
+      playerRig,
+      playerState.x,
+      playerState.y,
+      playerState.z,
+      playerState.yaw,
+      startSample.up,
+      0,
+      0,
+      0,
+      0,
+      false,
+      false,
+      false,
+      0.016,
+    );
+    rivals.forEach((r) => placeRivalOnTrack(r.rig, r.distance, r.lateral, 0, 0, 0, false, 0.016));
+
+    // Set initial camera right behind player facing their world heading
+    _carFwd.set(-Math.sin(playerState.yaw), 0, -Math.cos(playerState.yaw));
+    camera.position
+      .set(playerState.x, playerState.y, playerState.z)
+      .addScaledVector(_carFwd, -8.8)
+      .addScaledVector(startSample.up, 3.35);
+    camera.lookAt(
+      playerState.x + _carFwd.x * 20,
+      playerState.y + 1.1,
+      playerState.z + _carFwd.z * 20,
+    );
 
     const onResize = () => {
       if (!container) return;
@@ -365,6 +451,8 @@ export function RacingGame({
       frameId = window.setTimeout(poll, 5);
     };
 
+    const maxLat = BARRIER_OFFSET - 1.15;
+
     const tick = (now: number) => {
       if (disposed) return;
       const delta = Math.min(0.05, Math.max(0.001, (now - lastTime) / 1000));
@@ -396,16 +484,37 @@ export function RacingGame({
         const analogSteer = input.axis("STEER");
         const steering = THREE.MathUtils.clamp(digitalSteer + analogSteer, -1, 1);
 
-        const canNitro = active && input.pressed("NITRO") && playerState.nitro > 1 && playerState.speed > 12;
-        const topSpeed = canNitro ? 96 : 67;
+        // Current car heading basis vectors in XZ world space (strictly independent of track curvature!)
+        let fx = -Math.sin(playerState.yaw);
+        let fz = -Math.cos(playerState.yaw);
+        let rx = Math.cos(playerState.yaw);
+        let rz = -Math.sin(playerState.yaw);
+
+        let forwardSpeed = playerState.vx * fx + playerState.vz * fz;
+        let lateralSpeed = playerState.vx * rx + playerState.vz * rz;
+        const absForward = Math.abs(forwardSpeed);
+
+        const canNitro = active && input.pressed("NITRO") && playerState.nitro > 1 && forwardSpeed > 12;
+        const topSpeed = canNitro ? 96 : 68;
 
         if (accelerating) {
-          playerState.speed = Math.min(topSpeed, playerState.speed + (canNitro ? 44 : 29) * delta);
-        } else {
-          playerState.speed = Math.max(0, playerState.speed - (handbrake ? 22 : 9.5) * delta);
+          forwardSpeed = Math.min(topSpeed, forwardSpeed + (canNitro ? 46 : 30) * delta);
+        } else if (!braking) {
+          const drag = handbrake ? 22 : 9.5;
+          if (forwardSpeed > 0) {
+            forwardSpeed = Math.max(0, forwardSpeed - drag * delta);
+          } else if (forwardSpeed < 0) {
+            forwardSpeed = Math.min(0, forwardSpeed + drag * delta);
+          }
         }
+
         if (braking) {
-          playerState.speed = Math.max(0, playerState.speed - 48 * delta);
+          if (forwardSpeed > 1.5) {
+            forwardSpeed = Math.max(0, forwardSpeed - 54 * delta);
+          } else {
+            // Allow controlled reversing out of walls/barriers
+            forwardSpeed = Math.max(-22, forwardSpeed - 24 * delta);
+          }
         }
 
         if (canNitro) {
@@ -414,29 +523,90 @@ export function RacingGame({
           playerState.nitro = Math.min(100, playerState.nitro + 8 * delta);
         }
 
-        playerState.drifting = handbrake && Math.abs(steering) > 0.14 && playerState.speed > 18;
-        const steerAuthority = (playerState.drifting ? 1.45 : 0.92) * (0.28 + playerState.speed / 68);
-        playerState.lateral += steering * steerAuthority * 13.5 * delta;
+        playerState.drifting = handbrake && Math.abs(steering) > 0.14 && absForward > 18;
 
-        // Guardrail clamp with realistic speed scrub + impact thud
-        const maxLat = ROAD_HALF_WIDTH - 1.35;
-        if (Math.abs(playerState.lateral) > maxLat) {
-          playerState.lateral = Math.sign(playerState.lateral) * maxLat;
-          if (playerState.speed > 18 && raceState.collisionCooldown <= 0) {
-            playerState.speed *= 0.86;
-            playerState.shake = 0.25;
-            raceState.collisionCooldown = 0.45;
-            audioRef.current?.playCollision(0.6);
+        // Pure manual steering: yaw ONLY changes when player steers (if steering === 0, car drives straight!)
+        const steerScale =
+          Math.min(1, absForward / 8.5) * (1 - 0.18 * Math.min(1, absForward / 90)) * (forwardSpeed >= -0.5 ? 1 : -1);
+        const turnRate = playerState.drifting ? 2.15 : 1.72;
+        playerState.yaw -= steering * turnRate * steerScale * delta;
+
+        fx = -Math.sin(playerState.yaw);
+        fz = -Math.cos(playerState.yaw);
+        rx = Math.cos(playerState.yaw);
+        rz = -Math.sin(playerState.yaw);
+
+        // Strong lateral tire grip during normal cornering; looser slip angle when drifting
+        const lateralGripRate = playerState.drifting ? 2.8 : 10.5;
+        lateralSpeed *= Math.exp(-lateralGripRate * delta);
+
+        playerState.vx = fx * forwardSpeed + rx * lateralSpeed;
+        playerState.vz = fz * forwardSpeed + rz * lateralSpeed;
+
+        // Integrate world position directly in XZ
+        playerState.x += playerState.vx * delta;
+        playerState.z += playerState.vz * delta;
+
+        // Project onto circuit purely to sample road height, surface slope, lap progress, & guardrail bounds
+        let proj = trackData.projectOntoTrack(playerState.x, playerState.z, playerState.trackIndex);
+        playerState.trackIndex = proj.sampleIndex;
+
+        // Guardrail physical boundary collision (no rail-steering on open road)
+        if (Math.abs(proj.signedLateral) > maxLat) {
+          const sideSign = Math.sign(proj.signedLateral);
+          const clampedLat = sideSign * maxLat;
+          playerState.x = proj.position.x + proj.right.x * clampedLat;
+          playerState.z = proj.position.z + proj.right.z * clampedLat;
+
+          const nx = -sideSign * proj.right.x;
+          const nz = -sideSign * proj.right.z;
+          const vn = playerState.vx * nx + playerState.vz * nz;
+          if (vn < 0) {
+            playerState.vx -= 1.18 * vn * nx;
+            playerState.vz -= 1.18 * vn * nz;
+            const impactSeverity = Math.min(1, -vn / Math.max(Math.hypot(playerState.vx, playerState.vz), 1));
+            const scrub = 0.88 - impactSeverity * 0.24;
+            playerState.vx *= scrub;
+            playerState.vz *= scrub;
+
+            // Physical nose deflection only upon actual wall impact so the car doesn't wedge nose-first
+            if (-vn > 3.5) {
+              const wallTanX = proj.tangent.x;
+              const wallTanZ = proj.tangent.z;
+              const forwardAlign = fx * wallTanX + fz * wallTanZ >= 0 ? 1 : -1;
+              const targetWallYaw = Math.atan2(-(wallTanX * forwardAlign), -(wallTanZ * forwardAlign));
+              let yawDiff = targetWallYaw - playerState.yaw;
+              while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
+              while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+              playerState.yaw += yawDiff * Math.min(0.45, impactSeverity * 0.65);
+            }
+
+            if (-vn > 6 && raceState.collisionCooldown <= 0) {
+              playerState.shake = 0.28 + impactSeverity * 0.2;
+              raceState.collisionCooldown = 0.42;
+              audioRef.current?.playCollision(0.55 + impactSeverity * 0.45);
+            }
           }
+
+          proj = trackData.projectOntoTrack(playerState.x, playerState.z, playerState.trackIndex);
         }
 
-        playerState.heading = THREE.MathUtils.damp(
-          playerState.heading,
-          -steering * (playerState.drifting ? 0.34 : 0.14),
-          10,
-          delta,
-        );
-        playerState.distance += playerState.speed * delta;
+        playerState.y = THREE.MathUtils.damp(playerState.y, proj.position.y, 18, delta);
+        playerState.speed = Math.hypot(playerState.vx, playerState.vz);
+        playerState.trackDistance = proj.distance;
+
+        // Track genuine forward progress around the loop (wraps cleanly across start/finish seam)
+        let deltaProgress = proj.distance - playerState.prevTrackDistance;
+        if (deltaProgress < -trackData.lapLength * 0.5) {
+          deltaProgress += trackData.lapLength;
+        } else if (deltaProgress > trackData.lapLength * 0.5) {
+          deltaProgress -= trackData.lapLength;
+        }
+        playerState.prevTrackDistance = proj.distance;
+        playerState.progressDistance = Math.max(0, playerState.progressDistance + deltaProgress);
+
+        playerState.wrongWay = active && forwardSpeed > 8 && fx * proj.tangent.x + fz * proj.tangent.z < -0.35;
+
         raceState.collisionCooldown = Math.max(0, raceState.collisionCooldown - delta);
         playerState.shake = Math.max(0, playerState.shake - delta * 1.4);
 
@@ -444,8 +614,8 @@ export function RacingGame({
           raceState.time += delta;
         }
 
-        // Lap & finish detection
-        const currentLap = Math.floor(playerState.distance / trackData.lapLength) + 1;
+        // Lap & finish detection based on true signed lap distance completed
+        const currentLap = Math.floor(playerState.progressDistance / trackData.lapLength) + 1;
         if (currentLap > raceState.lastLap) {
           const lapDuration = raceState.time - raceState.lapStartTime;
           raceState.lapStartTime = raceState.time;
@@ -461,110 +631,135 @@ export function RacingGame({
           }
         }
 
-        // Update AI Rival Racers
+        // Update AI Rival Racers and compute true XZ car-to-car collisions
         for (const rival of rivals) {
           if (active) {
             const curvature = Math.abs(trackData.sampleAt(rival.distance + 22, _pos, _tan, _right, _up));
             const cornerFactor = THREE.MathUtils.clamp(1 - curvature * 0.42, 0.72, 1.0);
-            // Gentle rubber-banding so rivals stay competitive without teleporting
-            const gapToPlayer = playerState.distance - rival.distance;
+            const gapToPlayer = playerState.progressDistance - rival.distance;
             const rubberBand = mode === "RACE" ? THREE.MathUtils.clamp(gapToPlayer * 0.08, -4.5, 6.5) : 0;
             const targetSpeed = (rival.baseSpeed + rubberBand) * cornerFactor;
 
             rival.speed = THREE.MathUtils.damp(rival.speed, targetSpeed, 2.5, delta);
             rival.distance += rival.speed * delta;
 
-            // Overtaking / lane avoidance relative to player & other rivals
-            const distDiff = rival.distance - playerState.distance;
-            if (Math.abs(distDiff) < 16 && Math.abs(rival.lateral - playerState.lateral) < 3.2) {
-              rival.targetLateral = playerState.lateral > 0 ? -5.0 : 5.0;
+            const distDiff = rival.distance - playerState.progressDistance;
+            if (Math.abs(distDiff) < 16 && Math.abs(rival.lateral - proj.signedLateral) < 3.4) {
+              rival.targetLateral = proj.signedLateral > 0 ? -5.2 : 5.2;
             } else if (Math.abs(distDiff) > 28) {
-              // Follow gentle inside apex line on curves
               const curveSign = Math.sign(trackData.sampleAt(rival.distance + 18, _pos, _tan, _right, _up));
               rival.targetLateral = THREE.MathUtils.clamp(curveSign * 4.5, -6.5, 6.5);
             }
 
             rival.lateral = THREE.MathUtils.damp(rival.lateral, rival.targetLateral, 2.2, delta);
 
-            // Car-to-car collision with player
-            const longDiff = playerState.distance - rival.distance;
-            const latDiff = playerState.lateral - rival.lateral;
-            if (Math.abs(longDiff) < 4.3 && Math.abs(latDiff) < 2.05) {
-              const pushSign = latDiff >= 0 ? 1 : -1;
-              playerState.lateral = THREE.MathUtils.clamp(playerState.lateral + pushSign * 0.45, -maxLat, maxLat);
-              rival.lateral = THREE.MathUtils.clamp(rival.lateral - pushSign * 0.35, -maxLat, maxLat);
-              playerState.speed = Math.max(12, playerState.speed * 0.94);
+            // Real XZ distance check against player's free world coordinates
+            trackData.sampleAt(rival.distance, _pos, _tan, _right, _up);
+            _rivalPos.copy(_pos).addScaledVector(_right, rival.lateral);
+            const dx = playerState.x - _rivalPos.x;
+            const dz = playerState.z - _rivalPos.z;
+            const distSq = dx * dx + dz * dz;
+            const minCarSep = 2.65;
+            if (distSq > 1e-4 && distSq < minCarSep * minCarSep) {
+              const dist = Math.sqrt(distSq);
+              const nx = dx / dist;
+              const nz = dz / dist;
+              const push = minCarSep - dist;
+              playerState.x += nx * push * 0.65;
+              playerState.z += nz * push * 0.65;
+              playerState.vx += nx * 8.5;
+              playerState.vz += nz * 8.5;
+              playerState.vx *= 0.94;
+              playerState.vz *= 0.94;
+              rival.speed = Math.max(16, rival.speed * 0.94);
+
               if (raceState.collisionCooldown <= 0) {
-                playerState.shake = 0.32;
-                raceState.collisionCooldown = 0.45;
-                audioRef.current?.playCollision(0.95);
+                playerState.shake = 0.34;
+                raceState.collisionCooldown = 0.42;
+                audioRef.current?.playCollision(0.9);
               }
             }
           }
 
-          placeCarOnTrack(
+          placeRivalOnTrack(
             rival.rig,
             rival.distance,
             rival.lateral,
-            0,
             (rival.targetLateral - rival.lateral) * 0.025,
             (rival.targetLateral - rival.lateral) * 0.08,
             rival.speed,
-            false,
             rival.speed > 66,
-            false,
             delta,
           );
         }
 
-        // Place player car
-        placeCarOnTrack(
+        // Refresh world projection after rival collisions for final Y placement & shadow light
+        const finalProj = trackData.projectOntoTrack(playerState.x, playerState.z, playerState.trackIndex);
+        playerState.y = THREE.MathUtils.damp(playerState.y, finalProj.position.y, 18, delta);
+
+        const signedWheelSpeed = forwardSpeed >= -0.5 ? playerState.speed : -playerState.speed;
+        const visualSlip = playerState.drifting ? -steering * 0.24 : -steering * 0.05;
+        placePlayerInWorld(
           playerRig,
-          playerState.distance,
-          playerState.lateral,
-          playerState.heading,
-          steering * (playerState.drifting ? 0.14 : 0.05),
-          -steering * 0.38,
-          playerState.speed,
+          playerState.x,
+          playerState.y,
+          playerState.z,
+          playerState.yaw,
+          finalProj.up,
+          visualSlip,
+          steering * (playerState.drifting ? 0.14 : 0.055),
+          -steering * 0.42,
+          signedWheelSpeed,
           braking,
           canNitro,
           playerState.drifting,
           delta,
         );
 
-        // Update key light shadow camera around player
-        trackData.sampleAt(playerState.distance, _pos, _tan, _right, _up);
-        keyLight.position.set(_pos.x + 38, _pos.y + 70, _pos.z + 25);
-        keyLight.target.position.copy(_pos);
+        // Update key light shadow camera around player world position
+        keyLight.position.set(playerState.x + 38, playerState.y + 70, playerState.z + 25);
+        keyLight.target.position.set(playerState.x, playerState.y, playerState.z);
         keyLight.target.updateMatrixWorld();
 
-        // Smooth dynamic chase camera with FOV speed kick
+        // Smooth dynamic chase camera strictly following player's actual world heading (no track snapping)
         const desiredFov = 58 + (playerState.speed / 96) * 14 + (canNitro ? 5 : 0);
         if (Math.abs(camera.fov - desiredFov) > 0.1) {
           camera.fov = THREE.MathUtils.damp(camera.fov, desiredFov, 6, delta);
           camera.updateProjectionMatrix();
         }
 
-        const shakeX = playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
-        const shakeY = playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
+        const shakeX =
+          playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
+        const shakeY =
+          playerState.shake > 0 || canNitro ? (Math.random() - 0.5) * (playerState.shake + (canNitro ? 0.07 : 0)) : 0;
 
+        _carFwd.set(-Math.sin(playerState.yaw), 0, -Math.cos(playerState.yaw));
+        _carRight.set(Math.cos(playerState.yaw), 0, -Math.sin(playerState.yaw));
         _camTarget
-          .copy(_pos)
-          .addScaledVector(_right, playerState.lateral * 0.72 + shakeX)
-          .addScaledVector(_tan, -8.8)
-          .addScaledVector(_up, 3.35 + shakeY);
-        camera.position.lerp(_camTarget, 1 - Math.exp(-8.5 * delta));
+          .set(playerState.x, playerState.y, playerState.z)
+          .addScaledVector(_carFwd, -8.8)
+          .addScaledVector(finalProj.up, 3.35 + shakeY)
+          .addScaledVector(_carRight, shakeX);
+        camera.position.lerp(_camTarget, 1 - Math.exp(-9.5 * delta));
 
         _camLook
-          .copy(_pos)
-          .addScaledVector(_right, playerState.lateral * 0.45)
-          .addScaledVector(_tan, 24)
-          .addScaledVector(_up, 1.0);
+          .set(playerState.x, playerState.y, playerState.z)
+          .addScaledVector(_carFwd, 18)
+          .addScaledVector(finalProj.up, 1.15);
         camera.lookAt(_camLook);
 
-        audioRef.current?.updateTelemetry(playerState.speed, canNitro, playerState.drifting, false);
+        const brakingDecel = braking && forwardSpeed > 1.5;
+        const reversingThrottle = braking && forwardSpeed <= 1.5;
+        audioRef.current?.updateTelemetry(
+          playerState.speed,
+          accelerating || reversingThrottle,
+          brakingDecel,
+          canNitro,
+          playerState.drifting,
+          false,
+        );
       } else {
-        audioRef.current?.updateTelemetry(0, false, false, true);
+        audioRef.current?.updateTelemetry(0, false, false, false, false, true);
       }
 
       renderer.render(scene, camera);
@@ -573,21 +768,22 @@ export function RacingGame({
       raceState.publishAt += delta;
       if (raceState.publishAt >= 0.08) {
         raceState.publishAt = 0;
-        const standing = 1 + rivals.filter((r) => r.distance > playerState.distance).length;
+        const standing = 1 + rivals.filter((r) => r.distance > playerState.progressDistance).length;
         const dots: RacerDot[] = [
           ...rivals.map((r) => ({ id: r.id, ...toMinimapDot(trackData, r.distance), color: r.color, isPlayer: false })),
-          { id: "player", ...toMinimapDot(trackData, playerState.distance), color: "#e6392f", isPlayer: true },
+          { id: "player", ...toMinimapDot(trackData, playerState.trackDistance), color: "#e6392f", isPlayer: true },
         ];
         setTelemetry({
           speed: playerState.speed,
           nitro: playerState.nitro,
-          lap: Math.min(TOTAL_LAPS, Math.floor(playerState.distance / trackData.lapLength) + 1),
+          lap: Math.min(TOTAL_LAPS, Math.floor(playerState.progressDistance / trackData.lapLength) + 1),
           position: standing,
           totalRacers: 1 + rivals.length,
           time: raceState.time,
           bestLap: raceState.bestLap,
           countdown: Math.ceil(raceState.countdown),
           drifting: playerState.drifting,
+          wrongWay: playerState.wrongWay,
           finished: raceState.finished,
           dots,
         });
@@ -612,6 +808,8 @@ export function RacingGame({
       disposed = true;
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
+      playerRig.dispose();
+      rivals.forEach((r) => r.rig.dispose());
       window.removeEventListener("resize", onResize);
       renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
       renderer.domElement.removeEventListener("webglcontextrestored", onContextRestored);
@@ -624,6 +822,8 @@ export function RacingGame({
     if (nextMode) setMode(nextMode);
     setPaused(false);
     setTelemetry(initialTelemetry);
+    audioRef.current?.resetTransmission();
+    audioRef.current?.playStartRoar();
     setRaceId((id) => id + 1);
   };
 
@@ -750,6 +950,12 @@ export function RacingGame({
       </section>
 
       {telemetry.countdown > 0 && !paused && <div className="race-countdown tabular-nums">{telemetry.countdown}</div>}
+
+      {telemetry.wrongWay && telemetry.countdown === 0 && !paused && !telemetry.finished && (
+        <div className="race-wrong-way" role="status">
+          WRONG WAY
+        </div>
+      )}
 
       {paused && (
         <div className="race-overlay">
